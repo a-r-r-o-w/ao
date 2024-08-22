@@ -9,6 +9,7 @@ import json
 import re
 from typing import Optional
 
+from torch.profiler import profile, ProfilerActivity, record_function
 
 def profiler_output_to_filtered_time_by_kernel_name(
     prof, 
@@ -167,7 +168,7 @@ def get_name_to_shapes_iter(
         assert M == K == N == None, \
             f'M, K, N arguments not supported for shape_gen_name {shape_gen_name}'
         name_to_shapes = {}
-        min_power_of_2 = 5  # 32
+        min_power_of_2 = 8  # 256
         max_power_of_2 = 16  # 65,536
         for idx, power_of_2 in enumerate(range(min_power_of_2, max_power_of_2 + 1)):
             val = 2 ** power_of_2
@@ -329,3 +330,23 @@ def update_triton_kernels_in_prof_chome_trace_with_torch_logs(
     # out_file = perf_trace_file.replace('.json', '') + '_with_metadata.json'
     with open(modified_perf_trace_file, 'w') as f:
         json.dump(perf_trace, f)
+
+
+def get_gpu_kernel_gemm_time_s(f, *args, **kwargs):
+    # warmup
+    f(*args, **kwargs)
+    n_iter = 5
+    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+        for idx in range(n_iter):
+            f(*args, **kwargs) 
+    data = profiler_output_to_filtered_time_by_kernel_name(prof, n_iter, num_leaf_tensors=0) 
+    # there is only 1 key, aten::mm or aten::_scaled_mm, with unit nanoseconds
+    assert len(data) == 1
+    if "aten::mm" in data:
+        return data["aten::mm"] / 1e6 / n_iter
+    elif "aten::_scaled_mm" in data:
+        return data["aten::_scaled_mm"] / 1e6 / n_iter
+    else:
+        raise AssertionError("unexpected format of data")
+
+
