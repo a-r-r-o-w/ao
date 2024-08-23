@@ -912,6 +912,49 @@ def _linear_fp_act_int8_weight_impl(input_tensor, weight_tensor, bias):
     return y
 
 
+def _linear_fp_act_fp8_tensor_wise_weight_check(input_tensor: torch.Tensor, weight_tensor: AffineQuantizedTensor, bias: Optional[torch.Tensor]) -> bool:
+    choice = (
+        # input is native float tensor
+        not is_traceable_wrapper_subclass(input_tensor) and
+        input_tensor.is_floating_point() and
+        # weight is fp8 per channel quantized affine quantized tensor
+        isinstance(weight_tensor, AffineQuantizedTensor) and
+        (weight_tensor.layout_tensor.dtype in [torch.float8_e4m3fn, torch.float8_e5m2]) and
+        len(weight_tensor.shape) == 2 and
+        weight_tensor.shape == weight_tensor.block_size
+    )
+    return choice
+
+
+def _linear_fp_act_fp8_weight_impl(
+    input_tensor: torch.Tensor,
+    weight_tensor: AffineQuantizedTensor,
+    bias: Optional[torch.Tensor],
+):
+    from torchao.float8.inference import cast_to_float8_e4m3_inference, preprocess_data
+    from torchao.float8.float8_tensor import ScaledMMConfig, LinearMMConfig
+    from torchao.float8.float8_python_api import addmm_float8_unwrapped
+    scaled_mm_config_temp = ScaledMMConfig()  # I will also store on layout
+
+    w_data = weight_tensor.layout_tensor.int_data  # Fix I will make an fp8 layout
+    w_scale = weight_tensor.layout_tensor.scale
+    x_fp8 = cast_to_float8_e4m3_inference(input_tensor, LinearMMConfig())
+    x_data, w_data = preprocess_data(
+        x_fp8._data, w_data.T, scaled_mm_config_temp
+    )
+    x_scale = x_fp8._scale
+
+    return addmm_float8_unwrapped(
+        x_data,
+        x_scale,
+        w_data,
+        w_scale,
+        output_dtype=input_tensor.dtype,
+        bias=bias,
+        use_fast_accum=scaled_mm_config_temp.use_fast_accum,
+    )
+
+
 def _register_quantized_linear_dispatches():
     for dispatch_condition, impl in [
         (_linear_int8_act_int8_weight_check, _linear_int8_act_int8_weight_impl),
@@ -919,6 +962,7 @@ def _register_quantized_linear_dispatches():
         (_linear_quantized_act_fallback_check, _linear_quantized_act_fallback_impl),
         (_linear_bf16_act_uint4_weight_check, _linear_bf16_act_uint4_weight_impl),
         (_linear_fp_act_int8_weight_check, _linear_fp_act_int8_weight_impl),
+        (_linear_fp_act_fp8_tensor_wise_weight_check, _linear_fp_act_fp8_weight_impl)
     ]:
         _register_quantized_linear_dispatch(dispatch_condition, impl)
 
@@ -937,8 +981,10 @@ def _(func, types, args, kwargs):
     # using try/except here so that we can have a general fallback when input_tensor/weight_tensor
     # is not picked up by any of the dispatch paths in `_quantized_linear_op`, this allows us to
     # make the branches easier to understand in `_quantized_linear_op`
+    # try:
+    return weight_tensor._quantized_linear_op(input_tensor, weight_tensor, bias)
     try:
-        return weight_tensor._quantized_linear_op(input_tensor, weight_tensor, bias)
+        pass
     except:
         if isinstance(input_tensor, AffineQuantizedTensor):
             input_tensor = input_tensor.dequantize()

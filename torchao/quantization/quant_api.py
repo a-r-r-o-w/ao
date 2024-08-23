@@ -501,10 +501,31 @@ def float8_weight_only():
         eps = torch.finfo(torch.float32).eps
         zero_point_dtype = torch.float32
         block_size = (1, weight.shape[1])
-        return to_affine_quantized(input_float=weight, mapping_type=mapping_type, block_size=block_size, target_dtype=target_dtype,
+        return to_affine_quantized_float8(input_float=weight, mapping_type=mapping_type, block_size=block_size, target_dtype=target_dtype,
                 eps=eps, zero_point_dtype=zero_point_dtype)
 
     return _get_linear_subclass_inserter(apply_float8wo_quant)
+
+
+def float8_dynamic_activation(activation_dtype: torch.dtype = torch.float8_e4m3fn):
+    """
+    Applies float8 dynamic symmetric per-tensor activation quantization to linear layers.
+    """
+    def apply_float8_dynamic_activation_quant(weight: torch.Tensor):
+        # avoid circular dep
+        from torchao.dtypes import to_affine_quantized_float8
+
+        mapping_type = MappingType.SYMMETRIC
+        target_dtype = torch.float8_e4m3fn
+        eps = torch.finfo(torch.float32).eps
+        block_size = weight.shape
+        zero_point_dtype = torch.float32
+        out = to_affine_quantized_float8(input_float=weight, mapping_type=mapping_type, block_size=block_size, target_dtype=target_dtype,
+                eps=eps, zero_point_dtype=zero_point_dtype)
+        out.layout_tensor.scale = out.layout_tensor.scale.reciprocal()
+        out.layout_tensor.scale = out.layout_tensor.scale.to(torch.float32)
+        return out
+    return _get_linear_subclass_inserter(apply_float8_dynamic_activation_quant)
 
 
 def uintx_weight_only(bit_width, group_size=64, pack_dim=-1):
