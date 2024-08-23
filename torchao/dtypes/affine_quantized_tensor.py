@@ -30,6 +30,7 @@ from torchao.dtypes.utils import (
 from torch.utils._python_dispatch import is_traceable_wrapper_subclass
 from dataclasses import dataclass
 from torchao.utils import TORCH_VERSION_AT_LEAST_2_5
+from torchao.float8.float8_tensor import ScaledMMConfig
 
 aten = torch.ops.aten
 
@@ -294,7 +295,8 @@ class AffineQuantizedTensor(torch.Tensor):
         float8_data = layout_type.post_process(float8_data)
 
         layout_tensor_ctr = get_layout_tensor_constructor(type(layout_type))
-        layout_tensor = layout_tensor_ctr(float8_data, scale, zero_point, layout_type)
+        layout_tensor = layout_tensor_ctr(float8_data, scale, layout_type.mm_config, layout_type)
+        breakpoint()
         return cls(
             layout_tensor,
             block_size,
@@ -404,6 +406,13 @@ class TensorCoreTiledLayoutType(LayoutType):
     def extra_repr(self):
         return f"inner_k_tiles={self.inner_k_tiles}"
 
+
+@dataclass(frozen=True)
+class Float8LayoutType(LayoutType):
+    mm_config: ScaledMMConfig
+
+    def pre_process(self, input: torch.Tensor) -> torch.Tensor:
+        return input
 
 @register_layout_cls(PlainLayoutType)
 class PlainAQTLayout(AQTLayout):
@@ -551,6 +560,95 @@ class SemiSparseAQTLayout(PlainAQTLayout):
         assert isinstance(layout_type, SemiSparseLayoutType)
         int_data_compressed = torch._cslt_compress(int_data)
         return cls(int_data_compressed, scale, zero_point, layout_type)
+
+
+@register_layout_cls(Float8LayoutType)
+class Float8AQTLayout(AQTLayout):
+    """
+    Layout storage class for float8 layout for affine quantized tensor
+    """
+    float8_data: torch.Tensor
+    scale: torch.Tensor
+    transposed: bool
+    mm_config: Optional[ScaledMMConfig]
+    
+    def __new__(
+        cls,
+        float8_data: torch.Tensor,
+        scale: torch.Tensor,
+        mm_config: Optional[ScaledMMConfig],
+        transposed: bool,
+        layout_type: LayoutType,
+    ):
+        kwargs = {}
+        kwargs["device"] = float8_data.device
+        kwargs["layout"] = (
+            kwargs.get("layout") if kwargs.get("layout", False) else float8_data.layout
+        )
+        kwargs["dtype"] = float8_data.dtype
+        kwargs["requires_grad"] = False
+        shape = float8_data.shape
+        return torch.Tensor._make_wrapper_subclass(cls, shape, **kwargs)  # type: ignore[attr-defined]
+
+    def __init__(
+        self,
+        float8_data: torch.Tensor,
+        scale: torch.Tensor,
+        mm_config: Optional[ScaledMMConfig],
+        transposed: bool,
+        layout_type: LayoutType,
+    ):
+        self.float8_data = float8_data
+        self.scale = scale
+        self.transposed = transposed
+        self.mm_config = mm_config
+        self.layout_type = layout_type
+
+    def _apply_fn_to_data(self, fn):
+        fn(self.float8_data)
+        fn(self.scale)
+        return self
+    
+    def __tensor_flatten__(self):
+        return ["float8_data", "scale"], [self.transposed, self.mm_config, self.layout_type]
+
+    @classmethod
+    def __torch_dispatch__(cls, func, types, args, kwargs):
+        kwargs = {} if kwargs is None else kwargs
+
+        if func is aten.detach.default:
+            return return_and_correct_aliasing(
+                func, args, kwargs, args[0]._apply_fn_to_data(torch.detach)
+            )
+        if func is aten.t.default:
+            """we don't need to repack the weight and just rely on external
+            shape being changed and record the status of transpose/no-transpose
+            """
+            args[0].transposed = not args[0].transposed
+            return return_and_correct_aliasing(func, args, kwargs, args[0])
+
+        raise NotImplementedError(
+            f"Float8AQTLayout dispatch: attempting to run {func}, this is not supported"
+        )
+
+    __torch_function__ = torch._C._disabled_torch_function_impl
+
+    def get_plain(self) -> Tuple[torch.Tensor, torch.Tensor, ScaledMMConfig, LayoutType]:
+        return self.float8_data, self.scale,  None
+
+    def get_layout_type(self) -> LayoutType:
+        return self.layout_type
+
+    @classmethod
+    def from_plain(
+        cls,
+        float8_data: torch.Tensor,
+        scale: torch.Tensor,
+        zero_points: torch.Tensor,
+        layout_type: LayoutType,
+    ):
+        assert isinstance(layout_type, Float8LayoutType)
+        return cls(float8_data, scale, Float8LayoutType.mm_config, False, layout_type)
 
 
 @register_layout_cls(TensorCoreTiledLayoutType)
